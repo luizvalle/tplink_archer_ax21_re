@@ -1,0 +1,9 @@
+/captures/
+/analysis/
+/logs/
+*.bin
+*.dump
+*.img
+*.ubi
+*.ubifs
+*.partial
