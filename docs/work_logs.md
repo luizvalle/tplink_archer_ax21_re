@@ -545,4 +545,189 @@ MMMM$ ,MMMMM  MMMMM  MMMM    MMM       MMMM   MMMMM   MMMM    MMMM
  ---------------------------------------------------------------
 ```
 
+## 2026-11-03 - Exploring the live system as root
 
+My goal today is to explore the live system as root after a normal boot,
+using the UART login I found.
+
+First, I wanted to see which users are registered in the system:
+
+```sh
+$ root@Archer_AX21:/# cat /etc/passwd
+root:x:0:0:root:/root:/bin/ash
+daemon:*:1:1:daemon:/var:/bin/false
+ftp:*:55:55:ftp:/home/ftp:/bin/false
+network:*:101:101:network:/var:/bin/false
+nobody:*:65534:65534:nobody:/var:/bin/false
+admin:x:1000:0:admin:/var:/bin/false
+guest::2000:65534:guest:/var:/bin/false
+```
+
+The interesting ones are `nobody`, `admin` and `guest`.
+
+If we look at the passwords, it looks like `admin` has a password set. Also,
+the password was set in `2023-08-29`, which is before I got the router.
+
+```sh
+root@Archer_AX21:/# cat /etc/shadow
+root:x:0:0:99999:7:::
+daemon:*:0:0:99999:7:::
+ftp:*:0:0:99999:7:::
+network:*:0:0:99999:7:::
+nobody:*:0:0:99999:7:::
+admin:$1$FU4ynIgq$tES3mJOGZo66zCcNFcg041:19598:0:99999:7:::
+guest::0:0:99999:7:::
+```
+
+The password uses MD5-crypt (`$1`) with `FU4ynIgq` as the salt. The final
+salted hash is `tES3mJOGZo66zCcNFcg041`.
+
+I used [`hashcat`](https://hashcat.net/hashcat/) to crack the password above
+and got `admin` as the password.
+
+I tried this password in the web interface at `http://192.168.0.1`, but no luck.
+
+![Router web login screen](../images/web_login_screen.png).
+
+I then checked what processes are listening for traffic:
+
+```sh
+root@Archer_AX21:/www/webpages/locale# netstat -lntup
+Active Internet connections (only servers)
+Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name    
+tcp        0      0 0.0.0.0:20001           0.0.0.0:*               LISTEN      7421/dropbear
+tcp        0      0 127.0.0.1:20002         0.0.0.0:*               LISTEN      7359/tmpServer
+tcp        0      0 0.0.0.0:80              0.0.0.0:*               LISTEN      7443/uhttpd
+tcp        0      0 0.0.0.0:53              0.0.0.0:*               LISTEN      5939/dnsmasq
+tcp        0      0 0.0.0.0:443             0.0.0.0:*               LISTEN      7443/uhttpd
+tcp        0      0 127.0.0.1:5916          0.0.0.0:*               LISTEN      9476/acsd2
+tcp        0      0 :::1900                 :::*                    LISTEN      5693/miniupnpd
+tcp        0      0 :::53                   :::*                    LISTEN      5939/dnsmasq
+```
+
+There is an ssh service on port `20001` which would be interesting to explore later. The HTTP web server is
+on port `80` and rybs `uhttpd`.
+
+### Following web authentication
+
+I captured login traffic using Firefox's Network panel. Each exchange uses
+two POST requests:
+
+- `/cgi-bin/luci/;stok=/login?form=auth`: sends `operation=read` and receives
+  `key` and `seq`.
+- `/cgi-bin/luci/;stok=/login?form=login`: sends `data` and `sign`; the response
+  contains a Base64-encoded `data` string.
+
+I submitted one password four times and another once. The capture contains
+five `auth` / `login` pairs, matching those five submissions.
+
+| Field | Observation across the five exchanges |
+|---|---|
+| Auth response `key` | Same value every time |
+| Auth response `seq` | Different value every time |
+| Login request `data` | Different every time; 384 characters |
+| Login request `sign` | Different every time; 256 characters |
+| Login response `data` | Different every time; 152 Base64 characters decoding to 112 bytes |
+
+I took one the login response `data` fields and decoded it, but it's not plaintext:
+
+```sh
+printf '%s' 'VqDRQ2yKsMURpZHfBYTAjDka7R59PO3hBjLlOf8GTH+47qrLbcGcd4eXhddwf0r1vYqsQHPn+VmB7SrZveCCA0e/hQnJ1qVw1E1u+8Tcs4+9yQrtB9SMmINLZAM8nK1mXPScm5WC0G2emAKdEJl3JQ==' | base64 -d | xxd
+00000000: 56a0 d143 6c8a b0c5 11a5 91df 0584 c08c  V..Cl...........
+00000010: 391a ed1e 7d3c ede1 0632 e539 ff06 4c7f  9...}<...2.9..L.
+00000020: b8ee aacb 6dc1 9c77 8797 85d7 707f 4af5  ....m..w....p.J.
+00000030: bd8a ac40 73e7 f959 81ed 2ad9 bde0 8203  ...@s..Y..*.....
+00000040: 47bf 8509 c9d6 a570 d44d 6efb c4dc b38f  G......p.Mn.....
+00000050: bdc9 0aed 07d4 8c98 834b 6403 3c9c ad66  .........Kd.<..f
+00000060: 5cf4 9c9b 9582 d06d 9e98 029d 1099 7725  \......m......w%
+```
+
+Both requests hit the same endpoint:
+
+```
+scheme
+	http
+host
+	192.168.0.1
+filename
+	/cgi-bin/luci/;stok=/login
+```
+
+This seems to run a Lua application:
+
+```sh
+root@Archer_AX21:/www/webpages/locale# cat /www/cgi-bin/luci 
+#!/usr/bin/lua
+require "luci.cacheloader"
+require "luci.sgi.cgi"
+luci.dispatcher.indexcache = "/tmp/luci-indexcache"
+luci.sgi.cgi.run()
+```
+
+Looking for Lua files in the extracted rootfs, it seems that the code is in `/usr/lib/lua`:
+
+
+```sh
+$ find -type f -name "*.lua" -exec dirname {} \; | sort -u
+./lib/autodial
+./lib/domain_login
+./lib/ffs
+./lib/iptv
+./lib/nat
+./lib/netifd
+./lib/wportal
+./usr/lib/lua
+./usr/lib/lua/cloud
+./usr/lib/lua/cloud_req
+./usr/lib/lua/cloud/smart_home
+./usr/lib/lua/cloud/tp_apps
+./usr/lib/lua/log
+./usr/lib/lua/luci
+./usr/lib/lua/luci/cbi
+./usr/lib/lua/luci/controller
+./usr/lib/lua/luci/controller/admin
+./usr/lib/lua/luci/http
+./usr/lib/lua/luci/http/protocol
+./usr/lib/lua/luci/model
+./usr/lib/lua/luci/model/cbi/admin_network
+./usr/lib/lua/luci/model/cbi/firewall
+./usr/lib/lua/luci/model/network
+./usr/lib/lua/luci/sgi
+./usr/lib/lua/luci/smart_home
+./usr/lib/lua/luci/sys
+./usr/lib/lua/luci/sys/zoneinfo
+./usr/lib/lua/luci/tools
+./usr/lib/lua/nixio
+./usr/lib/lua/socket
+./usr/lib/lua/ssl
+```
+
+Indeed, if we check where Lua finds its modules inside the router, we find `/usr/lib/lua`:
+
+```sh
+root@Archer_AX21:/# lua -e 'print(package.path); print(package.cpath)'
+./?.lua;/usr/share/lua/?.lua;/usr/share/lua/?/init.lua;/usr/lib/lua/?.lua;/usr/lib/lua/?/init.lua
+./?.so;/usr/lib/lua/?.so;/usr/lib/lua/loadall.so
+```
+
+Looking for the module that has the `run()` function, we see:
+
+```sh
+$ file usr/lib/lua/luci/sgi/cgi.lua 
+usr/lib/lua/luci/sgi/cgi.lua: Lua bytecode, version 5.1
+```
+
+### Recovering the web password
+
+I found the encrypted web credential in `accountmgnt.admin.password`.
+Instead of continuing with a decompiler, I used the router's existing getter:
+
+```sh
+lua -e '
+local accounts = require "luci.model.accountmgnt"
+print(accounts.get_localPassword())
+'
+```
+
+It returned a plaintext password, and I verified that it works in the web
+interface. I am keeping the value out of these logs.
