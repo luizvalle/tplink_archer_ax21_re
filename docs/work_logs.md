@@ -543,6 +543,10 @@ MMMM$ ,MMMMM  MMMMM  MMMM    MMM       MMMM   MMMMM   MMMM    MMMM
  ---------------------------------------------------------------
    For those about to rock... (Attitude Adjustment, unknown)
  ---------------------------------------------------------------
+root@Archer_AX21:/# id
+uid=0(root) gid=0(root) groups=0(root)
+root@Archer_AX21:/# uname -a
+Linux Archer_AX21 4.1.52 #1 SMP PREEMPT Fri Nov 25 17:25:31 CST 2022 armv7l GNU/Linux
 ```
 
 ## 2026-11-03 - Exploring the live system as root
@@ -731,3 +735,64 @@ print(accounts.get_localPassword())
 
 It returned a plaintext password, and I verified that it works in the web
 interface. I am keeping the value out of these logs.
+
+### Understanding SSH login
+
+The normally booted Dropbear server listens on port `20001`.
+`SysAccountLogin 'off'` adds the vendor-specific `-C` flag, selecting web-account
+authentication instead of Linux-account authentication.
+
+Linux `admin` is defined in `/etc/passwd` and `/etc/shadow`; web `admin` is
+configured in UCI `accountmgnt`. They have the same name but separate passwords.
+SSH in web-account mode checks the web password, then uses an OS identity for
+the session. It does not use the special UART root-password derivation.
+
+I authenticated as `admin` with the web password, but the default server refused
+both PTY allocation and the shell request. Its startup script leaves the `-L`
+session-enable flag commented out.
+
+I started a temporary second server from the UART root shell, leaving the
+original instance untouched:
+
+```sh
+/usr/sbin/dropbear -C -L \
+  -r /etc/dropbear/dropbear_rsa_host_key \
+  -p 192.168.0.1:2222 \
+  -P /tmp/dropbear-lab.pid
+```
+
+From my computer, I connected using the web password:
+
+```sh
+ssh -p 2222 -o HostKeyAlgorithms=+ssh-rsa admin@192.168.0.1
+```
+
+The host-key option permits legacy RSA/SHA-1 host signatures for this connection
+only. I verified shell access without UART; `id` reported UID `1000(admin)`,
+not UID `0(root)`, with membership in group `0(root)`.
+
+This server listens on the LAN address and does not survive a reboot.
+
+### Persistent root SSH
+
+I added a separate key-only root server on port `2223`, keeping the stock
+`20001` server unchanged. It uses Linux accounts, enables sessions with `-L`,
+and disables password authentication with `-s`. This build required an RSA
+public key rather than ED25519:
+
+```sh
+ssh -p 2223 \
+  -o HostKeyAlgorithms=+ssh-rsa \
+  -o PubkeyAcceptedAlgorithms=+ssh-rsa \
+  -o PreferredAuthentications=publickey \
+  root@192.168.0.1
+```
+
+Since `/etc` is recreated in RAM at boot, I stored the public key, server host
+key, and startup helper in `/data/ssh-root`. I backed up the original Dropbear
+startup script and added one helper call inside `start()` in the flash-backed
+firmware copy, then restored read-only mounting.
+
+After reboot, I verified root SSH access, UID `0`, the password-disabled flag,
+binding to `192.168.0.1:2223`, the original listener, and read-only rootfs.
+Firmware updates may overwrite the hook.
